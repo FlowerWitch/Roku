@@ -1,2 +1,11 @@
 # Roku
-找桶用的 翻垃圾桶啊嗯
+
+因为经常去的酒吧里的「六」卖完了，所以叫「Roku」了。~~不过老板说要给我再单独进一瓶「翠」（sui）嘻嘻~~
+
+## Example
+
+```
+node Roku.js -u http://example.com -L 2
+node Roku.js -l urls.txt --ob buckets.txt
+node Roku.js -l urls.txt -X PUT --oj result.json
+```
