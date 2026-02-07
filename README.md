@@ -9,3 +9,5 @@ node Roku.js -u http://example.com -L 2
 node Roku.js -l urls.txt --ob buckets.txt
 node Roku.js -l urls.txt -X PUT --oj result.json
 ```
+
+完全由ai写的 我是傲慢的使用者or农场主嘻嘻
