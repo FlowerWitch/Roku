@@ -124,47 +124,92 @@ async function putTest(bucket) {
   };
 }
 
-/* ========== Playwright 渲染 ========== */
-async function fetchRendered(url) {
-  const { chromium } = require('playwright');
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
-  const found = new Set();
+/* ========== Playwright 渲染（带错误处理和复用） ========== */
+let browser = null;
+let browserLaunching = false;
 
-  page.on('request', r => {
-    const m = r.url().match(OSS_REGEX);
-    if (m) m.forEach(x => found.add(x));
-  });
-
+async function getBrowser() {
+  if (browser) return browser;
+  if (browserLaunching) {
+    while (browserLaunching) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    return browser;
+  }
+  
+  browserLaunching = true;
   try {
+    const { chromium } = require('playwright');
+    browser = await chromium.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+  } catch (err) {
+    console.error(`${COLOR.YELLOW}[!] 浏览器启动失败: ${err.message}${COLOR.RESET}`);
+  }
+  browserLaunching = false;
+  return browser;
+}
+
+async function fetchRendered(url) {
+  const found = new Set();
+  
+  try {
+    const bw = await getBrowser();
+    if (!bw) return [];
+    
+    const context = await bw.newContext();
+    const page = await context.newPage();
+    
+    page.on('request', r => {
+      const m = r.url().match(OSS_REGEX);
+      if (m) m.forEach(x => found.add(x));
+    });
+
     await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
     const html = await page.content();
     extractBuckets(html).forEach(x => found.add(x));
-  } catch {}
-
-  await browser.close();
+    
+    await context.close();
+  } catch (err) {
+    console.log(`    ${COLOR.YELLOW}[render error] ${err.message}${COLOR.RESET}`);
+  }
+  
   return [...found];
 }
 
-/* ========== 并发池 ========== */
-async function runPool(items, worker) {
-  let i = 0;
-  const pool = Array(CONCURRENCY).fill(0).map(async () => {
-    while (i < items.length) {
-      const cur = items[i++];
-      await worker(cur);
+async function closeBrowser() {
+  if (browser) {
+    await browser.close();
+    browser = null;
+  }
+}
+
+/* ========== 并发控制（带实时输出） ========== */
+async function runWithRealtimeOutput(urls, worker) {
+  const executing = new Set();
+  
+  for (const url of urls) {
+    const promise = worker(url).then(() => {
+      executing.delete(promise);
+    }).catch(err => {
+      console.error(`[!] Error processing ${url}: ${err.message}`);
+      executing.delete(promise);
+    });
+    executing.add(promise);
+    
+    if (executing.size >= CONCURRENCY) {
+      await Promise.race(executing);
     }
-  });
-  await Promise.all(pool);
+  }
+  
+  await Promise.all(executing);
 }
 
 /* ========== 主逻辑 ========== */
 (async () => {
-  const urlResults = new Map();
-
-  await runPool(urls, async (target) => {
-    const logs = [];
-    const localRecords = [];
+  await runWithRealtimeOutput(urls, async (target) => {
+    console.log(`[*] ${target}`);
     let buckets = [];
 
     if (LEVEL === 1) {
@@ -174,7 +219,7 @@ async function runPool(items, worker) {
     if (LEVEL === 2) {
       buckets = extractBuckets(await fetchHTTP(target));
       if (!buckets.length) {
-        logs.push('    [smart] fallback to render');
+        console.log('    [smart] fallback to render');
         buckets = await fetchRendered(target);
       }
     }
@@ -184,8 +229,7 @@ async function runPool(items, worker) {
     }
 
     for (const b of buckets) {
-      // Bucket 绿色
-      logs.push(`    ${COLOR.GREEN}- ${b}${COLOR.RESET}`);
+      console.log(`    ${COLOR.GREEN}- ${b}${COLOR.RESET}`);
       allBuckets.add(b);
 
       let putStatus = '';
@@ -194,27 +238,17 @@ async function runPool(items, worker) {
         const putResult = await putTest(b);
         putStatus = putResult.success ? 'PUT_OK' : '';
         putBool = putResult.success;
-        logs.push(putResult.log);
+        console.log(putResult.log);
       }
 
-      localRecords.push({ target, bucket: b, put: putStatus, putBool });
+      records.push({ target, bucket: b, put: putStatus, putBool });
     }
-
-    urlResults.set(target, { logs, records: localRecords });
   });
 
-  for (const target of urls) {
-    const result = urlResults.get(target);
-    if (result) {
-      console.log(`[*] ${target}`);
-      if (result.logs.length) {
-        console.log(result.logs.join('\n'));
-      }
-      result.records.forEach(r => records.push(r));
-    }
-  }
+  // 关闭浏览器
+  await closeBrowser();
 
-  /* ========== 输出 ========== */
+  /* ========== 文件输出 ========== */
   if (argv.ob) {
     fs.writeFileSync(argv.ob, [...allBuckets].join('\n'));
     console.log(`\n[+] Exported ${allBuckets.size} buckets to ${argv.ob}`);
@@ -243,9 +277,9 @@ async function runPool(items, worker) {
   if (argv.oj) {
     const jsonOutput = {};
     for (const target of urls) {
-      const result = urlResults.get(target);
-      if (result && result.records.length > 0) {
-        jsonOutput[target] = result.records.map(r => ({
+      const targetRecords = records.filter(r => r.target === target);
+      if (targetRecords.length > 0) {
+        jsonOutput[target] = targetRecords.map(r => ({
           bucket: r.bucket,
           put: r.putBool
         }));
