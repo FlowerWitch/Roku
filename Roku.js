@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-// npm install axios minimist playwright
 const fs = require('fs');
 const axios = require('axios');
 const crypto = require('crypto');
 const minimist = require('minimist');
 
 const argv = minimist(process.argv.slice(2), {
-  boolean: ['h', 'help'],
+  boolean: ['h', 'help', 'pipe'],
   alias: { h: 'help' }
 });
 
@@ -14,13 +13,14 @@ const argv = minimist(process.argv.slice(2), {
 const COLOR = {
   GREEN: '\x1b[32m',
   RED: '\x1b[31m',
+  YELLOW: '\x1b[33m',
   RESET: '\x1b[0m'
 };
 
 // 帮助信息
 if (argv.h || argv.help) {
   console.log(`
-  ❀Ali OSS Scan❀
+OSS Hunter - 阿里云OSS桶探测工具
 
 用法:
   node ${process.argv[1]} -u <url> [选项]
@@ -31,6 +31,7 @@ if (argv.h || argv.help) {
   -l <file>         从文件读取URL列表（每行一个）
   -L <level>        探测级别: 1=HTTP only, 2=Smart(默认), 3=Render only
   -X <method>       测试方法: PUT (测试桶是否可写)
+  --pipe            管道模式: 只输出bucket URL到stdout（用于|传递给其他工具）
   
 输出选项:
   --ob <file>       输出bucket列表（纯文本）
@@ -48,12 +49,17 @@ if (argv.h || argv.help) {
   node ${process.argv[1]} -u http://example.com -L 2
   node ${process.argv[1]} -l urls.txt --ob buckets.txt
   node ${process.argv[1]} -l urls.txt -X PUT --oj result.json
+  
+管道用法:
+  node ${process.argv[1]} -l urls.txt --pipe | nuclei -t aliyun-oss.yaml
+  node ${process.argv[1]} -u http://example.com --pipe | httpx -mc 200
 `);
   process.exit(0);
 }
 
 const LEVEL = parseInt(argv.L || 2, 10);
 const CONCURRENCY = 10;
+const PIPE_MODE = argv.pipe;
 
 const urls = [];
 if (argv.u) urls.push(argv.u);
@@ -70,7 +76,7 @@ if (argv.l) {
   }
 }
 if (!urls.length) {
-  console.error('Usage: -u|-l [-L 1|2|3] [-X PUT] [--ob file] [--csv file] [--md file] [--oj file]');
+  console.error('Usage: -u|-l [-L 1|2|3] [-X PUT] [--ob file] [--csv file] [--md file] [--oj file] [--pipe]');
   console.error('Use -h or --help for more information');
   process.exit(1);
 }
@@ -145,7 +151,9 @@ async function getBrowser() {
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
   } catch (err) {
-    console.error(`${COLOR.YELLOW}[!] 浏览器启动失败: ${err.message}${COLOR.RESET}`);
+    if (!PIPE_MODE) {
+      console.error(`${COLOR.YELLOW}[!] 浏览器启动失败: ${err.message}${COLOR.RESET}`);
+    }
   }
   browserLaunching = false;
   return browser;
@@ -172,7 +180,9 @@ async function fetchRendered(url) {
     
     await context.close();
   } catch (err) {
-    console.log(`    ${COLOR.YELLOW}[render error] ${err.message}${COLOR.RESET}`);
+    if (!PIPE_MODE) {
+      console.log(`    ${COLOR.YELLOW}[render error] ${err.message}${COLOR.RESET}`);
+    }
   }
   
   return [...found];
@@ -193,7 +203,9 @@ async function runWithRealtimeOutput(urls, worker) {
     const promise = worker(url).then(() => {
       executing.delete(promise);
     }).catch(err => {
-      console.error(`[!] Error processing ${url}: ${err.message}`);
+      if (!PIPE_MODE) {
+        console.error(`[!] Error processing ${url}: ${err.message}`);
+      }
       executing.delete(promise);
     });
     executing.add(promise);
@@ -209,7 +221,10 @@ async function runWithRealtimeOutput(urls, worker) {
 /* ========== 主逻辑 ========== */
 (async () => {
   await runWithRealtimeOutput(urls, async (target) => {
-    console.log(`[*] ${target}`);
+    if (!PIPE_MODE) {
+      console.log(`[*] ${target}`);
+    }
+    
     let buckets = [];
 
     if (LEVEL === 1) {
@@ -218,8 +233,10 @@ async function runWithRealtimeOutput(urls, worker) {
 
     if (LEVEL === 2) {
       buckets = extractBuckets(await fetchHTTP(target));
-      if (!buckets.length) {
+      if (!buckets.length && !PIPE_MODE) {
         console.log('    [smart] fallback to render');
+        buckets = await fetchRendered(target);
+      } else if (!buckets.length) {
         buckets = await fetchRendered(target);
       }
     }
@@ -229,12 +246,18 @@ async function runWithRealtimeOutput(urls, worker) {
     }
 
     for (const b of buckets) {
-      console.log(`    ${COLOR.GREEN}- ${b}${COLOR.RESET}`);
+      // 管道模式：直接输出 bucket URL，不添加任何其他内容
+      if (PIPE_MODE) {
+        console.log(b);
+      } else {
+        console.log(`    ${COLOR.GREEN}- ${b}${COLOR.RESET}`);
+      }
+      
       allBuckets.add(b);
 
       let putStatus = '';
       let putBool = false;
-      if (argv.X === 'PUT') {
+      if (argv.X === 'PUT' && !PIPE_MODE) {
         const putResult = await putTest(b);
         putStatus = putResult.success ? 'PUT_OK' : '';
         putBool = putResult.success;
@@ -247,6 +270,11 @@ async function runWithRealtimeOutput(urls, worker) {
 
   // 关闭浏览器
   await closeBrowser();
+
+  // 管道模式下不输出文件
+  if (PIPE_MODE) {
+    process.exit(0);
+  }
 
   /* ========== 文件输出 ========== */
   if (argv.ob) {
